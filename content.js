@@ -453,48 +453,56 @@
     return true; // 保持消息通道开启
   });
 
-  // ==================== 云学堂倒计时倍速补丁 ====================
+  // ==================== 云学堂倒计时倍速补丁 v2 ====================
 
   /**
    * 检测并劫持云学堂课程页面的"剩余学习时间"倒计时
-   * 原理：原生的倒计时基于 video.duration - video.currentTime 计算
-   * 当视频倍速播放时，实际剩余时间 = 原生剩余时间 / playbackRate
-   * 我们通过定时器覆盖倒计时显示，让用户看到"倍速后的真实剩余时间"
+   *
+   * v2 修复：不再读取原生DOM文本做二次除法（会导致双重加速跳0）。
+   * 改为直接从 video 元素计算：
+   *   真实剩余时间 = (video.duration - video.currentTime) / playbackRate
+   *
+   * 这样显示的是"按当前倍速，真实还需要等待多少秒"。
+   *
+   * ⚠️ 重要说明：此补丁仅修改前端显示，无法绕过云学堂后端的
+   *    累计观看时长校验。课程完成由后端决定，倒计时只是UI提示。
    */
   (function initYxtCountdownPatch() {
     const COUNTDOWN_SELECTOR = '.yxtulcdsdk-course-player__countdown';
     const COUNTDOWN_TEXT_SELECTOR = '.yxtulcdsdk-course-player__countdown .yxt-color-warning';
 
     let patchInterval = null;
-    let lastOriginalText = '';
+    let lastDisplayText = '';
+    let lastVideoTime = 0;
+    let lastRealTimestamp = 0;
 
     /**
      * 格式化秒数为 "X分钟 Y秒"
+     * 最低保留 1 秒，避免直接跳到 0
      */
     function formatMinutesSeconds(totalSeconds) {
-      if (totalSeconds <= 0) return '0分钟 0秒';
+      if (totalSeconds <= 0) return '即将完成';
       const m = Math.floor(totalSeconds / 60);
       const s = Math.floor(totalSeconds % 60);
       if (m > 0) {
         return `${m}分钟 ${s}秒`;
       }
+      if (s < 1) return '1秒';
       return `${s}秒`;
     }
 
     /**
-     * 从原生倒计时文本解析出剩余秒数
-     * 支持格式: "2分钟 56秒" / "56秒" / "1小时 20分钟 30秒"
+     * 计算倍速后的真实剩余时间
+     * 直接从 video 元素取数据，不依赖原生DOM文本
      */
-    function parseRemainingSeconds(text) {
-      if (!text) return 0;
-      let seconds = 0;
-      const hourMatch = text.match(/(\d+)\s*小时?/);
-      const minMatch = text.match(/(\d+)\s*分钟?/);
-      const secMatch = text.match(/(\d+)\s*秒/);
-      if (hourMatch) seconds += parseInt(hourMatch[1]) * 3600;
-      if (minMatch) seconds += parseInt(minMatch[1]) * 60;
-      if (secMatch) seconds += parseInt(secMatch[1]);
-      return seconds;
+    function getAdjustedRemainingSeconds(video, speed) {
+      if (!video || !isFinite(video.duration)) return 0;
+      const rawRemaining = video.duration - video.currentTime;
+      if (rawRemaining <= 0) return 0;
+
+      // 核心计算：在倍速下，真实需要等待的时间
+      // 例如：剩余 200 秒内容，20x 倍速 → 真实只需等 10 秒
+      return rawRemaining / speed;
     }
 
     /**
@@ -505,32 +513,28 @@
       const containerEl = document.querySelector(COUNTDOWN_SELECTOR);
       if (!textEl || !containerEl) return;
 
-      // 获取当前视频倍速
+      // 获取当前视频
       const videos = scanVideos();
       const video = videos[0];
       const speed = video ? video.playbackRate : state.currentSpeed;
-      if (speed <= 1) return; // 1x 及以下不需要补丁
+      if (speed <= 1) {
+        // 1x 及以下不干预，让原生逻辑正常显示
+        lastDisplayText = '';
+        return;
+      }
 
-      // 读取原生倒计时文本
-      const originalText = textEl.textContent.trim();
-      if (!originalText) return;
-
-      // 解析原生剩余秒数
-      const originalSeconds = parseRemainingSeconds(originalText);
-      if (originalSeconds <= 0) return;
-
-      // 计算倍速后的实际剩余时间
-      const adjustedSeconds = originalSeconds / speed;
+      // 直接从 video 计算真实剩余时间
+      const adjustedSeconds = getAdjustedRemainingSeconds(video, speed);
 
       // 生成新的显示文本
       const adjustedText = formatMinutesSeconds(adjustedSeconds);
 
       // 如果和上次显示不同，则更新（减少DOM操作）
-      if (adjustedText !== lastOriginalText) {
+      if (adjustedText !== lastDisplayText) {
         textEl.textContent = adjustedText;
-        lastOriginalText = adjustedText;
+        lastDisplayText = adjustedText;
 
-        // 给容器添加一个标记，表示已被补丁处理
+        // 给容器添加标记
         containerEl.dataset.vssPatched = 'true';
         containerEl.dataset.vssSpeed = speed.toFixed(2);
       }
@@ -542,7 +546,7 @@
     function startPatch() {
       if (patchInterval) return;
       patchInterval = setInterval(applyCountdownPatch, 500); // 每500ms更新一次
-      console.log('[VSS] 云学堂倒计时倍速补丁已启动');
+      console.log('[VSS] 云学堂倒计时倍速补丁 v2 已启动');
     }
 
     /**
@@ -552,7 +556,8 @@
       if (patchInterval) {
         clearInterval(patchInterval);
         patchInterval = null;
-        console.log('[VSS] 云学堂倒计时倍速补丁已停止');
+        lastDisplayText = '';
+        console.log('[VSS] 云学堂倒计时倍速补丁 v2 已停止');
       }
     }
 
