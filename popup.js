@@ -1,97 +1,104 @@
 /**
- * popup.js - 控制面板交互逻辑
+ * popup.js - 挂机控制面板
  */
 
 document.addEventListener('DOMContentLoaded', () => {
   // DOM 元素
-  const elSpeedDisplay = document.getElementById('currentSpeed');
-  const elSpeedSlider = document.getElementById('speedSlider');
-  const elVideoList = document.getElementById('videoList');
-  const elVideoCount = document.getElementById('videoCount');
-  const elSyncStatus = document.getElementById('syncStatus');
-  const elSyncUrl = document.getElementById('syncUrl');
-  const elSyncRoomId = document.getElementById('syncRoomId');
-  const elChkAsMaster = document.getElementById('chkAsMaster');
-  const elSyncForm = document.getElementById('syncForm');
-  const elSyncConnected = document.getElementById('syncConnected');
-  const elConnectedRoomId = document.getElementById('connectedRoomId');
-  const elConnectedRole = document.getElementById('connectedRole');
+  const elStatusDot = document.getElementById('statusDot');
+  const elStatusText = document.getElementById('statusText');
+  const elStatusDetail = document.getElementById('statusDetail');
+  const elBtnStart = document.getElementById('btnStart');
+  const elBtnStop = document.getElementById('btnStop');
+  const elChkIdleMode = document.getElementById('chkIdleMode');
+  const elProgressFill = document.getElementById('progressFill');
+  const elCurrentTime = document.getElementById('currentTime');
+  const elDuration = document.getElementById('duration');
+  const elProgressPercent = document.getElementById('progressPercent');
+  const elStatRuntime = document.getElementById('statRuntime');
+  const elStatCourses = document.getElementById('statCourses');
+  const elStatStatus = document.getElementById('statStatus');
 
   let currentTabId = null;
-  let selectedVideoIndex = 0;
+  let startTime = null;
+  let runtimeTimer = null;
+  let courseCount = 0;
 
   // ==================== 初始化 ====================
 
-  // 获取当前活动标签页
   chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
     if (tabs[0]) {
       currentTabId = tabs[0].id;
-      refreshVideos();
-      refreshSyncStatus();
+      refreshStatus();
     }
   });
 
-  // 恢复设置
-  chrome.storage.local.get(['vss_speed', 'vss_syncUrl', 'vss_syncRoomId'], (result) => {
-    if (result.vss_speed) {
-      updateSpeedUI(result.vss_speed);
-    }
-    if (result.vss_syncUrl) {
-      elSyncUrl.value = result.vss_syncUrl;
-    }
-    if (result.vss_syncRoomId) {
-      elSyncRoomId.value = result.vss_syncRoomId;
-    }
+  // ==================== 控制按钮 ====================
+
+  elBtnStart.addEventListener('click', () => {
+    sendToContent('start', {}, (response) => {
+      if (response && response.success) {
+        setRunningUI(true);
+        startRuntimeTimer();
+      }
+    });
   });
 
-  // ==================== 视频列表 ====================
-
-  function refreshVideos() {
-    if (!currentTabId) return;
-
-    chrome.tabs.sendMessage(currentTabId, {
-      target: 'content',
-      action: 'getVideos'
-    }, (response) => {
-      if (chrome.runtime.lastError) {
-        renderEmpty('无法访问此页面（可能受权限限制）');
-        return;
-      }
-
-      if (response && response.count > 0) {
-        renderVideoList(response.videos);
-      } else {
-        renderEmpty('当前页面未检测到视频');
+  elBtnStop.addEventListener('click', () => {
+    sendToContent('stop', {}, (response) => {
+      if (response && response.success) {
+        setRunningUI(false);
+        stopRuntimeTimer();
       }
     });
+  });
+
+  elChkIdleMode.addEventListener('change', () => {
+    sendToContent('toggleIdleMode');
+  });
+
+  document.getElementById('btnSkipNext').addEventListener('click', () => {
+    sendToContent('clickNext');
+  });
+
+  document.getElementById('btnRefresh').addEventListener('click', () => {
+    refreshStatus();
+  });
+
+  // ==================== UI 更新 ====================
+
+  function setRunningUI(running) {
+    if (running) {
+      elBtnStart.style.display = 'none';
+      elBtnStop.style.display = 'flex';
+      elStatusDot.className = 'status-dot running';
+      elStatusText.textContent = '挂机中';
+      elStatusText.style.color = '#48bb78';
+      elStatusDetail.textContent = '后台自动刷课，请勿关闭标签页';
+      elStatStatus.textContent = '挂机中';
+    } else {
+      elBtnStart.style.display = 'flex';
+      elBtnStop.style.display = 'none';
+      elStatusDot.className = 'status-dot stopped';
+      elStatusText.textContent = '已停止';
+      elStatusText.style.color = '#fc8181';
+      elStatusDetail.textContent = '点击"开始挂机"自动刷课';
+      elStatStatus.textContent = '已停止';
+      elProgressFill.style.width = '0%';
+      elProgressPercent.textContent = '0%';
+    }
   }
 
-  function renderVideoList(videos) {
-    elVideoCount.textContent = videos.length;
-    elVideoList.innerHTML = '';
+  function updateVideoProgress(video) {
+    if (!video) return;
 
-    videos.forEach((video, index) => {
-      const item = document.createElement('div');
-      item.className = 'video-item' + (index === selectedVideoIndex ? ' active' : '');
-      item.innerHTML = `
-        <div class="video-thumb">${index + 1}</div>
-        <div class="video-info">
-          <div class="video-title">视频 ${index + 1}</div>
-          <div class="video-meta">${formatTime(video.currentTime)} / ${formatTime(video.duration)} · ${video.speed}x</div>
-        </div>
-        <div class="video-status ${video.paused ? 'paused' : 'playing'}">${video.paused ? '暂停' : '播放中'}</div>
-      `;
-      item.addEventListener('click', () => {
-        selectedVideoIndex = index;
-        refreshVideos();
-      });
-      elVideoList.appendChild(item);
-    });
-  }
+    const pct = video.duration > 0
+      ? Math.round((video.currentTime / video.duration) * 100)
+      : 0;
 
-  function renderEmpty(msg) {
-    elVideoCount.textContent = '0';
-    elVideoList.innerHTML = `<div class="empty-state">${msg}</div>`;
+    elProgressFill.style.width = pct + '%';
+    elCurrentTime.textContent = formatTime(video.currentTime);
+    elDuration.textContent = formatTime(video.duration);
+    elProgressPercent.textContent = pct + '%';
   }
 
   function formatTime(seconds) {
@@ -101,172 +108,94 @@ document.addEventListener('DOMContentLoaded', () => {
     return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
   }
 
-  // ==================== 倍速控制 ====================
-
-  function updateSpeedUI(speed) {
-    elSpeedDisplay.textContent = speed.toFixed(2);
-    elSpeedSlider.value = speed;
-
-    // 更新按钮高亮
-    document.querySelectorAll('.speed-btn').forEach(btn => {
-      const btnSpeed = parseFloat(btn.dataset.speed);
-      btn.classList.toggle('active', Math.abs(btnSpeed - speed) < 0.01);
-    });
+  function formatRuntime(ms) {
+    const totalSec = Math.floor(ms / 1000);
+    const h = Math.floor(totalSec / 3600);
+    const m = Math.floor((totalSec % 3600) / 60);
+    const s = totalSec % 60;
+    if (h > 0) return `${h}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
+    return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
   }
 
-  // 预设倍速按钮
-  document.querySelectorAll('.speed-btn').forEach(btn => {
-    btn.addEventListener('click', () => {
-      const speed = parseFloat(btn.dataset.speed);
-      sendToContent('setSpeed', { speed });
-    });
-  });
+  // ==================== 运行时长计时器 ====================
 
-  // 滑块
-  elSpeedSlider.addEventListener('input', (e) => {
-    const speed = parseFloat(e.target.value);
-    elSpeedDisplay.textContent = speed.toFixed(2);
-  });
-
-  elSpeedSlider.addEventListener('change', (e) => {
-    const speed = parseFloat(e.target.value);
-    sendToContent('setSpeed', { speed });
-  });
-
-  // 加速/减速/重置
-  document.getElementById('btnIncSpeed').addEventListener('click', () => {
-    sendToContent('adjustSpeed', { delta: 0.25 });
-  });
-
-  document.getElementById('btnDecSpeed').addEventListener('click', () => {
-    sendToContent('adjustSpeed', { delta: -0.25 });
-  });
-
-  document.getElementById('btnResetSpeed').addEventListener('click', () => {
-    sendToContent('setSpeed', { speed: 1.0 });
-  });
-
-  // ==================== 快捷操作 ====================
-
-  document.getElementById('btnTogglePlay').addEventListener('click', () => {
-    sendToContent('togglePlay', { videoIndex: selectedVideoIndex });
-  });
-
-  document.getElementById('btnSkipBack').addEventListener('click', () => {
-    sendToContent('skip', { videoIndex: selectedVideoIndex, seconds: -10 });
-  });
-
-  document.getElementById('btnSkipForward').addEventListener('click', () => {
-    sendToContent('skip', { videoIndex: selectedVideoIndex, seconds: 10 });
-  });
-
-  // ==================== 联网同步 ====================
-
-  function refreshSyncStatus() {
-    sendToContent('getSyncStatus', {}, (response) => {
-      if (response) {
-        updateSyncUI(response);
-      }
-    });
+  function startRuntimeTimer() {
+    startTime = Date.now();
+    if (runtimeTimer) clearInterval(runtimeTimer);
+    runtimeTimer = setInterval(() => {
+      const elapsed = Date.now() - startTime;
+      elStatRuntime.textContent = formatRuntime(elapsed);
+    }, 1000);
   }
 
-  function updateSyncUI(status) {
-    if (status.enabled && status.connected) {
-      elSyncStatus.textContent = '已连接';
-      elSyncStatus.className = 'status-indicator connected';
-      elSyncForm.style.display = 'none';
-      elSyncConnected.style.display = 'block';
-      elConnectedRoomId.textContent = status.roomId || '-';
-      elConnectedRole.textContent = status.isMaster ? '主控端 ⭐' : '接收端';
-    } else if (status.enabled) {
-      elSyncStatus.textContent = '连接中...';
-      elSyncStatus.className = 'status-indicator connecting';
-      elSyncForm.style.display = 'block';
-      elSyncConnected.style.display = 'none';
-    } else {
-      elSyncStatus.textContent = '未连接';
-      elSyncStatus.className = 'status-indicator disconnected';
-      elSyncForm.style.display = 'block';
-      elSyncConnected.style.display = 'none';
+  function stopRuntimeTimer() {
+    if (runtimeTimer) {
+      clearInterval(runtimeTimer);
+      runtimeTimer = null;
     }
+    startTime = null;
+    elStatRuntime.textContent = '00:00';
   }
 
-  document.getElementById('btnConnect').addEventListener('click', () => {
-    const url = elSyncUrl.value.trim();
-    const roomId = elSyncRoomId.value.trim();
-    const asMaster = elChkAsMaster.checked;
-
-    if (!url) {
-      alert('请输入服务器地址');
-      return;
-    }
-    if (!roomId) {
-      alert('请输入房间ID');
-      return;
-    }
-
-    // 保存设置
-    chrome.storage.local.set({
-      vss_syncUrl: url,
-      vss_syncRoomId: roomId
-    });
-
-    sendToContent('connectSync', { url, roomId, asMaster }, (response) => {
-      if (response && response.success) {
-        updateSyncUI({ enabled: true, connected: true, roomId, isMaster: asMaster });
-      }
-    });
-  });
-
-  document.getElementById('btnDisconnect').addEventListener('click', () => {
-    sendToContent('disconnectSync', {}, () => {
-      updateSyncUI({ enabled: false, connected: false });
-    });
-  });
-
-  // ==================== 工具函数 ====================
+  // ==================== 通信 ====================
 
   function sendToContent(action, data = {}, callback) {
     if (!currentTabId) return;
-
-    chrome.tabs.sendMessage(currentTabId, {
-      target: 'content',
-      action,
-      ...data
-    }, (response) => {
+    chrome.tabs.sendMessage(currentTabId, { target: 'content', action, ...data }, (response) => {
       if (chrome.runtime.lastError) {
         console.log('通信失败:', chrome.runtime.lastError.message);
         if (callback) callback(null);
         return;
       }
-
-      // 如果响应包含速度信息，更新UI
-      if (response && response.speed !== undefined) {
-        updateSpeedUI(response.speed);
-      }
-
       if (callback) callback(response);
     });
   }
 
-  // 监听来自 content script 的消息（如倍速变化、连接状态变化）
+  function refreshStatus() {
+    sendToContent('getStatus', {}, (response) => {
+      if (!response) return;
+
+      setRunningUI(response.isRunning);
+
+      if (response.video) {
+        updateVideoProgress(response.video);
+      }
+
+      if (response.isRunning && !runtimeTimer) {
+        startRuntimeTimer();
+      } else if (!response.isRunning && runtimeTimer) {
+        stopRuntimeTimer();
+      }
+
+      if (response.idleMode !== undefined) {
+        elChkIdleMode.checked = response.idleMode;
+      }
+    });
+  }
+
+  // 监听来自 content 的消息
   chrome.runtime.onMessage.addListener((message) => {
     if (message.target !== 'popup') return;
 
-    if (message.type === 'speedChanged' && message.speed !== undefined) {
-      updateSpeedUI(message.speed);
-    }
-
-    if (message.type === 'syncStatus') {
-      updateSyncUI({
-        enabled: message.status !== 'disconnected',
-        connected: message.status === 'connected',
-        roomId: message.roomId,
-        isMaster: message.isMaster
-      });
+    switch (message.type) {
+      case 'status':
+        elStatStatus.textContent = message.status;
+        break;
+      case 'progress':
+        updateVideoProgress(message);
+        break;
+      case 'nextCourse':
+        courseCount++;
+        elStatCourses.textContent = courseCount;
+        break;
+      case 'finished':
+        setRunningUI(false);
+        stopRuntimeTimer();
+        elStatusDetail.textContent = message.message;
+        break;
     }
   });
 
-  // 定时刷新视频状态
-  setInterval(refreshVideos, 2000);
+  // 定时刷新状态
+  setInterval(refreshStatus, 3000);
 });

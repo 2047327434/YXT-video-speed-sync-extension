@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "视频倍速同步助手",
   "version": "1.0.0",
-  "description": "检测页面视频并自定义倍速播放，支持联网同步视频播放进度",
+  "description": "云学堂自动挂课助手：自动播放视频、视频结束后自动切下一课、后台静默挂机、防检测",
   "permissions": [
     "activeTab",
     "storage",

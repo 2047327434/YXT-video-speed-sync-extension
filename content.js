@@ -1,824 +1,392 @@
 /**
- * content.js - 注入页面，负责视频检测、倍速控制、进度同步
+ * content.js - 云学堂自动挂课助手
+ *
+ * 功能：自动播放视频、视频结束后自动切下一课、后台静默挂机、防检测
  */
 
 (function () {
   'use strict';
 
-  // 避免重复注入
-  if (window.__videoSpeedSyncInjected) return;
-  window.__videoSpeedSyncInjected = true;
+  if (window.__yxtAutoStudyInjected) return;
+  window.__yxtAutoStudyInjected = true;
 
   // ==================== 状态管理 ====================
   const state = {
-    videos: [],           // 检测到的视频元素
-    currentSpeed: 1.0,    // 当前倍速
-    syncEnabled: false,   // 是否开启联网同步
-    syncRoomId: '',       // 同步房间ID
-    ws: null,             // WebSocket 连接
-    wsUrl: 'wss://your-sync-server.com/ws', // 默认同步服务器地址
-    isMaster: false,      // 是否为主控端
-    lastReportedTime: 0,  // 上次上报进度时间
-    ignoreNextEvent: false, // 忽略下一次事件（防止循环触发）
-    videoMeta: new Map(), // 视频元数据 (video -> {id, url})
+    enabled: false,           // 是否开启自动挂机
+    idleMode: true,           // 是否后台静默模式（静音）
+    isRunning: false,         // 当前是否正在挂机流程中
+    currentVideo: null,       // 当前控制的视频
+    courseTotal: 0,           // 课程总数
+    courseCurrent: 0,         // 当前课程序号
+    lastAction: '等待中',      // 最后一次操作
+    startTime: null,          // 挂机开始时间
+    popupPort: null,          // 与 popup 的通信端口
+    antiDetectTimer: null,    // 防检测定时器
+    checkTimer: null,         // 主检测循环定时器
   };
 
+  // ==================== DOM 选择器 ====================
+  const SELECTORS = {
+    video: 'video',
+    nextBtn: 'button:has(.yxtf-icon-arrow-right), button span:contains("下一个")',
+    // 云学堂课程列表项
+    courseItem: '.task-content-item, .chapter-item, .course-item',
+    // 弹窗关闭按钮
+    dialogClose: '.yxtf-dialog__headerbtn, .yxt-dialog__headerbtn, .yxtf-icon-close',
+    // 倒计时组件
+    countdown: '.yxtulcdsdk-course-player__countdown',
+    // 播放按钮（如果视频没自动播放）
+    playBtn: '.jw-icon-playback, .yxt-biz-video-playbtn',
+  };
+
+  // ==================== 日志输出 ====================
+  function log(msg, type = 'info') {
+    const time = new Date().toLocaleTimeString();
+    const prefix = `[YXT挂机 ${time}]`;
+    const fullMsg = `${prefix} ${msg}`;
+
+    if (type === 'error') console.error(fullMsg);
+    else if (type === 'warn') console.warn(fullMsg);
+    else console.log(fullMsg);
+
+    state.lastAction = msg;
+    broadcastToPopup({ type: 'status', status: msg });
+  }
+
   // ==================== 视频检测 ====================
+  function findVideo() {
+    const v = document.querySelector('video');
+    if (v && v.readyState >= 1) {
+      state.currentVideo = v;
+      return v;
+    }
+    // 尝试在 iframe 中查找
+    const iframes = document.querySelectorAll('iframe');
+    for (const iframe of iframes) {
+      try {
+        const iv = iframe.contentDocument?.querySelector('video');
+        if (iv) { state.currentVideo = iv; return iv; }
+      } catch (e) {}
+    }
+    return null;
+  }
+
+  // ==================== 核心挂机逻辑 ====================
 
   /**
-   * 扫描页面中的所有视频元素
+   * 启动挂机
    */
-  function scanVideos() {
-    const videos = Array.from(document.querySelectorAll('video'));
-    const iframes = Array.from(document.querySelectorAll('iframe'));
+  function startAutoStudy() {
+    if (state.isRunning) return;
+    state.enabled = true;
+    state.isRunning = true;
+    state.startTime = Date.now();
 
-    // 处理 iframe 中的视频（如果同源）
-    iframes.forEach(iframe => {
-      try {
-        const iframeVideos = iframe.contentDocument?.querySelectorAll('video');
-        if (iframeVideos) videos.push(...Array.from(iframeVideos));
-      } catch (e) {
-        // 跨域 iframe，无法访问
-      }
-    });
+    log('🚀 自动挂机已启动');
+    broadcastToPopup({ type: 'started', startTime: state.startTime });
 
-    // 过滤掉已销毁的视频
-    state.videos = videos.filter(v => document.contains(v) || v.isConnected);
+    // 立即执行一次
+    tick();
 
-    // 为新视频绑定事件
-    state.videos.forEach(video => {
-      if (!state.videoMeta.has(video)) {
-        bindVideoEvents(video);
-      }
-    });
+    // 每 2 秒检测一次状态
+    state.checkTimer = setInterval(tick, 2000);
 
-    return state.videos;
+    // 启动防检测机制
+    startAntiDetect();
   }
 
   /**
-   * 为视频元素生成唯一ID
+   * 停止挂机
    */
-  function getVideoId(video) {
-    if (!state.videoMeta.has(video)) {
-      const id = 'v_' + Math.random().toString(36).substr(2, 9);
-      state.videoMeta.set(video, {
-        id,
-        url: video.currentSrc || video.src || location.href,
-        title: document.title,
-        pageUrl: location.href
-      });
+  function stopAutoStudy() {
+    state.enabled = false;
+    state.isRunning = false;
+
+    if (state.checkTimer) {
+      clearInterval(state.checkTimer);
+      state.checkTimer = null;
     }
-    return state.videoMeta.get(video).id;
+    stopAntiDetect();
+
+    // 恢复音量
+    const video = findVideo();
+    if (video) video.muted = false;
+
+    log('⏹️ 自动挂机已停止');
+    broadcastToPopup({ type: 'stopped' });
+  }
+
+  /**
+   * 主检测循环
+   */
+  function tick() {
+    if (!state.enabled) return;
+
+    const video = findVideo();
+
+    // 1. 没找到视频 → 可能在加载中，继续等待
+    if (!video) {
+      log('⏳ 等待视频加载...');
+      return;
+    }
+
+    // 2. 绑定视频事件（只绑定一次）
+    if (!video.dataset.yxtBound) {
+      bindVideoEvents(video);
+      video.dataset.yxtBound = 'true';
+    }
+
+    // 3. 后台模式：静音
+    if (state.idleMode && !video.muted) {
+      video.muted = true;
+      log('🔇 已静音（后台模式）');
+    }
+
+    // 4. 如果视频暂停了，自动播放
+    if (video.paused) {
+      // 尝试直接 play
+      const playPromise = video.play();
+      if (playPromise) {
+        playPromise.catch(() => {
+          // 浏览器阻止自动播放，尝试点击播放按钮
+          clickPlayButton();
+        });
+      }
+      log('▶️ 视频已自动播放');
+    }
+
+    // 5. 更新进度到 popup
+    broadcastToPopup({
+      type: 'progress',
+      currentTime: video.currentTime,
+      duration: video.duration,
+      paused: video.paused,
+      speed: video.playbackRate,
+    });
   }
 
   /**
    * 绑定视频事件
    */
   function bindVideoEvents(video) {
-    const videoId = getVideoId(video);
-
-    // 播放事件
-    video.addEventListener('play', () => {
-      if (state.ignoreNextEvent) { state.ignoreNextEvent = false; return; }
-      broadcastAction('play', { videoId, currentTime: video.currentTime });
+    // 视频播放结束 → 自动下一课
+    video.addEventListener('ended', () => {
+      log('✅ 当前视频播放完毕，准备切换下一课');
+      setTimeout(() => clickNextButton(), 2000);
     });
 
-    // 暂停事件
+    // 视频进度接近结尾也触发（有些视频 ended 事件不可靠）
+    video.addEventListener('timeupdate', () => {
+      if (video.duration && video.currentTime >= video.duration - 3) {
+        if (!video.dataset.yxtNearEnd) {
+          video.dataset.yxtNearEnd = 'true';
+          log('⏭️ 视频即将结束，准备切换下一课');
+          setTimeout(() => clickNextButton(), 3000);
+        }
+      }
+    });
+
+    // 防止页面失焦时视频被暂停
     video.addEventListener('pause', () => {
-      if (state.ignoreNextEvent) { state.ignoreNextEvent = false; return; }
-      broadcastAction('pause', { videoId, currentTime: video.currentTime });
-    });
-
-    // 进度跳转事件
-    video.addEventListener('seeked', () => {
-      if (state.ignoreNextEvent) { state.ignoreNextEvent = false; return; }
-      broadcastAction('seek', { videoId, currentTime: video.currentTime });
-    });
-
-    // 倍速变化事件
-    video.addEventListener('ratechange', () => {
-      if (state.ignoreNextEvent) { state.ignoreNextEvent = false; return; }
-      // 如果是我们自己设置的倍速，不广播
-      if (video.dataset.vssSettingSpeed === 'true') {
-        delete video.dataset.vssSettingSpeed;
-        return;
+      if (state.enabled && video.currentTime < video.duration - 1) {
+        // 如果不是用户手动暂停（接近结尾），自动恢复播放
+        setTimeout(() => {
+          if (state.enabled && video.paused) {
+            video.play().catch(() => {});
+            log('🛡️ 检测到视频被暂停，已自动恢复');
+          }
+        }, 1000);
       }
-      broadcastAction('speed', { videoId, speed: video.playbackRate });
     });
+  }
 
-    // 定期上报进度（主控端）
-    setInterval(() => {
-      if (state.syncEnabled && state.isMaster && !video.paused) {
-        const now = Date.now();
-        if (now - state.lastReportedTime > 3000) { // 每3秒上报一次
-          broadcastAction('progress', {
-            videoId,
-            currentTime: video.currentTime,
-            speed: video.playbackRate
-          });
-          state.lastReportedTime = now;
+  // ==================== 自动切课 ====================
+
+  /**
+   * 点击"下一个"按钮
+   */
+  function clickNextButton() {
+    if (!state.enabled) return;
+
+    // 尝试多种选择器定位"下一个"按钮
+    const nextBtn =
+      document.querySelector('button span .yxtf-icon-arrow-right')?.closest('button') ||
+      document.querySelector('button:has(.yxtf-icon-arrow-right)') ||
+      Array.from(document.querySelectorAll('button')).find(btn =>
+        btn.textContent.includes('下一个')
+      );
+
+    if (nextBtn) {
+      nextBtn.click();
+      log('➡️ 已点击"下一个"');
+      state.courseCurrent++;
+
+      // 重置视频绑定标记
+      if (state.currentVideo) {
+        delete state.currentVideo.dataset.yxtBound;
+        delete state.currentVideo.dataset.yxtNearEnd;
+      }
+      state.currentVideo = null;
+
+      broadcastToPopup({ type: 'nextCourse', current: state.courseCurrent });
+    } else {
+      log('⚠️ 未找到"下一个"按钮，可能已是最后一课');
+      broadcastToPopup({ type: 'finished', message: '所有课程已完成' });
+      stopAutoStudy();
+    }
+  }
+
+  /**
+   * 点击播放按钮（处理浏览器自动播放限制）
+   */
+  function clickPlayButton() {
+    const btn =
+      document.querySelector('.jw-icon-playback') ||
+      document.querySelector('.yxt-biz-video-playbtn') ||
+      document.querySelector('.jw-display-icon-container');
+    if (btn) {
+      btn.click();
+      log('🖱️ 已点击播放按钮');
+    }
+  }
+
+  // ==================== 防检测机制 ====================
+
+  /**
+   * 启动防检测
+   * 1. 页面失焦时保持视频播放
+   * 2. 随机小暂停模拟真实用户
+   * 3. 自动关闭弹窗
+   */
+  function startAntiDetect() {
+    if (state.antiDetectTimer) return;
+
+    // 失焦保活：覆盖 visibilitychange
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+
+    // 随机暂停模拟
+    state.antiDetectTimer = setInterval(() => {
+      if (!state.enabled) return;
+
+      // 每 30~60 秒随机暂停 1~3 秒，模拟真实用户偶尔离开
+      const shouldPause = Math.random() < 0.05; // 5% 概率
+      if (shouldPause) {
+        const video = findVideo();
+        if (video && !video.paused && video.currentTime < video.duration - 10) {
+          video.pause();
+          const pauseMs = 1000 + Math.random() * 2000;
+          log(`🎭 模拟真实用户暂停 ${(pauseMs/1000).toFixed(1)} 秒`);
+          setTimeout(() => {
+            if (state.enabled && video.paused) {
+              video.play().catch(() => {});
+            }
+          }, pauseMs);
         }
       }
-    }, 1000);
+
+      // 自动关闭弹窗
+      closeDialogs();
+
+    }, 10000);
   }
 
-  // ==================== 倍速控制 ====================
-
-  /**
-   * 设置所有视频的倍速
-   */
-  function setSpeed(speed) {
-    state.currentSpeed = parseFloat(speed);
-    scanVideos().forEach(video => {
-      video.dataset.vssSettingSpeed = 'true';
-      video.playbackRate = state.currentSpeed;
-    });
-
-    // 保存到 storage
-    chrome.storage.local.set({ vss_speed: state.currentSpeed });
-
-    // 广播倍速变化
-    if (state.syncEnabled && state.isMaster) {
-      state.videos.forEach(video => {
-        broadcastAction('speed', { videoId: getVideoId(video), speed: state.currentSpeed });
-      });
+  function stopAntiDetect() {
+    if (state.antiDetectTimer) {
+      clearInterval(state.antiDetectTimer);
+      state.antiDetectTimer = null;
     }
+    document.removeEventListener('visibilitychange', handleVisibilityChange);
   }
 
   /**
-   * 加速/减速微调
+   * 页面失焦时保持播放
    */
-  function adjustSpeed(delta) {
-    const newSpeed = Math.max(0.25, Math.min(20, state.currentSpeed + delta));
-    setSpeed(newSpeed);
-  }
-
-  // ==================== 联网同步 ====================
-
-  /**
-   * 连接同步服务器
-   */
-  function connectSync(url, roomId, asMaster = false) {
-    disconnectSync();
-
-    state.wsUrl = url;
-    state.syncRoomId = roomId;
-    state.isMaster = asMaster;
-    state.syncEnabled = true;
-
-    try {
-      state.ws = new WebSocket(url);
-
-      state.ws.onopen = () => {
-        console.log('[VSS] WebSocket 已连接');
-        sendWsMessage('join', { roomId });
-        broadcastToPopup({ type: 'syncStatus', status: 'connected', roomId });
-      };
-
-      state.ws.onmessage = (event) => {
-        try {
-          const msg = JSON.parse(event.data);
-          handleSyncMessage(msg);
-        } catch (e) {
-          console.error('[VSS] 消息解析失败:', e);
-        }
-      };
-
-      state.ws.onclose = () => {
-        console.log('[VSS] WebSocket 已断开');
-        broadcastToPopup({ type: 'syncStatus', status: 'disconnected' });
-        // 自动重连
-        if (state.syncEnabled) {
-          setTimeout(() => connectSync(url, roomId, asMaster), 3000);
-        }
-      };
-
-      state.ws.onerror = (err) => {
-        console.error('[VSS] WebSocket 错误:', err);
-        broadcastToPopup({ type: 'syncStatus', status: 'error', error: '连接失败' });
-      };
-
-    } catch (e) {
-      console.error('[VSS] 连接失败:', e);
-      broadcastToPopup({ type: 'syncStatus', status: 'error', error: e.message });
-    }
-  }
-
-  /**
-   * 断开同步服务器
-   */
-  function disconnectSync() {
-    state.syncEnabled = false;
-    if (state.ws) {
-      state.ws.close();
-      state.ws = null;
-    }
-  }
-
-  /**
-   * 发送 WebSocket 消息
-   */
-  function sendWsMessage(action, data) {
-    if (state.ws && state.ws.readyState === WebSocket.OPEN) {
-      state.ws.send(JSON.stringify({ action, ...data, timestamp: Date.now() }));
-    }
-  }
-
-  /**
-   * 广播动作到同步服务器
-   */
-  function broadcastAction(action, data) {
-    if (!state.syncEnabled || !state.isMaster) return;
-    sendWsMessage(action, data);
-  }
-
-  /**
-   * 处理接收到的同步消息
-   */
-  function handleSyncMessage(msg) {
-    // 只处理来自其他客户端的消息（非自己发出的）
-    if (msg.clientId === getClientId()) return;
-
-    const video = findVideoById(msg.videoId);
-    if (!video) return;
-
-    state.ignoreNextEvent = true;
-
-    switch (msg.action) {
-      case 'play':
-        if (video.paused) video.play();
-        if (msg.currentTime !== undefined) {
-          video.currentTime = msg.currentTime;
-        }
-        break;
-
-      case 'pause':
-        if (!video.paused) video.pause();
-        if (msg.currentTime !== undefined) {
-          video.currentTime = msg.currentTime;
-        }
-        break;
-
-      case 'seek':
-        video.currentTime = msg.currentTime;
-        break;
-
-      case 'speed':
-        state.currentSpeed = msg.speed;
-        video.playbackRate = msg.speed;
-        broadcastToPopup({ type: 'speedChanged', speed: msg.speed });
-        break;
-
-      case 'progress':
-        // 进度同步：只在小范围内调整，避免跳跃
-        if (msg.currentTime !== undefined) {
-          const diff = Math.abs(video.currentTime - msg.currentTime);
-          if (diff > 2) { // 偏差超过2秒才调整
-            video.currentTime = msg.currentTime;
-          }
-        }
-        if (msg.speed !== undefined && video.playbackRate !== msg.speed) {
-          video.playbackRate = msg.speed;
-          state.currentSpeed = msg.speed;
-        }
-        break;
-
-      case 'join':
-        // 有新成员加入，如果是主控端，发送当前状态
-        if (state.isMaster) {
-          const masterVideo = state.videos[0];
-          if (masterVideo) {
-            sendWsMessage('syncState', {
-              videoId: getVideoId(masterVideo),
-              currentTime: masterVideo.currentTime,
-              speed: masterVideo.playbackRate,
-              paused: masterVideo.paused,
-              targetClient: msg.clientId
-            });
-          }
-        }
-        break;
-
-      case 'syncState':
-        // 收到主控端的状态同步
-        if (msg.targetClient === getClientId()) {
-          if (msg.currentTime !== undefined) video.currentTime = msg.currentTime;
-          if (msg.speed !== undefined) {
-            video.playbackRate = msg.speed;
-            state.currentSpeed = msg.speed;
-          }
-          if (msg.paused !== undefined) {
-            msg.paused ? video.pause() : video.play();
-          }
-        }
-        break;
-    }
-  }
-
-  /**
-   * 根据ID查找视频元素
-   */
-  function findVideoById(videoId) {
-    for (const [video, meta] of state.videoMeta) {
-      if (meta.id === videoId && (document.contains(video) || video.isConnected)) {
-        return video;
+  function handleVisibilityChange() {
+    if (state.enabled && document.hidden) {
+      const video = findVideo();
+      if (video && video.paused) {
+        video.play().catch(() => {});
+        log('🛡️ 页面失焦，已保活视频播放');
       }
     }
-    // 如果找不到，尝试重新扫描
-    scanVideos();
-    for (const [video, meta] of state.videoMeta) {
-      if (meta.id === videoId && (document.contains(video) || video.isConnected)) {
-        return video;
+  }
+
+  /**
+   * 自动关闭弹窗
+   */
+  function closeDialogs() {
+    const closeBtns = document.querySelectorAll(
+      '.yxtf-dialog__headerbtn, .yxt-dialog__headerbtn, .yxtf-icon-close, .yxtf-button--primary span:contains("确定")'
+    );
+    closeBtns.forEach(btn => {
+      // 只关闭非关键弹窗（如提示、广告）
+      const dialog = btn.closest('.yxtf-dialog, .yxt-dialog');
+      if (dialog) {
+        const title = dialog.querySelector('.yxtf-dialog__title, .yxt-dialog__title')?.textContent || '';
+        // 不关闭考试、练习等关键弹窗
+        if (!/考试|练习|测评|问卷|测试/.test(title)) {
+          btn.click();
+          log('❌ 已自动关闭弹窗');
+        }
       }
-    }
-    return null;
+    });
   }
 
-  /**
-   * 获取客户端唯一ID
-   */
-  function getClientId() {
-    let id = sessionStorage.getItem('vss_clientId');
-    if (!id) {
-      id = 'c_' + Math.random().toString(36).substr(2, 9);
-      sessionStorage.setItem('vss_clientId', id);
-    }
-    return id;
-  }
+  // ==================== 通信接口 ====================
 
-  // ==================== 与 Popup / Background 通信 ====================
-
-  /**
-   * 向 popup 广播消息
-   */
   function broadcastToPopup(message) {
-    chrome.runtime.sendMessage({
-      target: 'popup',
-      ...message
-    }).catch(() => {});
+    chrome.runtime.sendMessage({ target: 'popup', ...message }).catch(() => {});
   }
 
-  /**
-   * 监听来自 popup / background 的消息
-   */
   chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     if (request.target !== 'content') return;
 
     switch (request.action) {
-      case 'getVideos':
-        scanVideos();
-        sendResponse({
-          count: state.videos.length,
-          videos: state.videos.map((v, i) => ({
-            index: i,
-            id: getVideoId(v),
-            currentTime: v.currentTime,
-            duration: v.duration,
-            speed: v.playbackRate,
-            paused: v.paused,
-            src: v.currentSrc || v.src || '未知来源'
-          }))
-        });
-        break;
-
-      case 'setSpeed':
-        setSpeed(request.speed);
-        sendResponse({ success: true, speed: state.currentSpeed });
-        break;
-
-      case 'adjustSpeed':
-        adjustSpeed(request.delta);
-        sendResponse({ success: true, speed: state.currentSpeed });
-        break;
-
-      case 'togglePlay':
-        {
-          const video = state.videos[request.videoIndex || 0];
-          if (video) {
-            video.paused ? video.play() : video.pause();
-            sendResponse({ success: true, paused: video.paused });
-          } else {
-            sendResponse({ success: false, error: '视频不存在' });
-          }
-        }
-        break;
-
-      case 'seek':
-        {
-          const video = state.videos[request.videoIndex || 0];
-          if (video) {
-            video.currentTime = request.time;
-            sendResponse({ success: true });
-          } else {
-            sendResponse({ success: false, error: '视频不存在' });
-          }
-        }
-        break;
-
-      case 'connectSync':
-        connectSync(request.url, request.roomId, request.asMaster);
+      case 'start':
+        startAutoStudy();
         sendResponse({ success: true });
         break;
 
-      case 'disconnectSync':
-        disconnectSync();
+      case 'stop':
+        stopAutoStudy();
         sendResponse({ success: true });
         break;
 
-      case 'getSyncStatus':
+      case 'getStatus':
+        const video = findVideo();
         sendResponse({
-          enabled: state.syncEnabled,
-          connected: state.ws?.readyState === WebSocket.OPEN,
-          roomId: state.syncRoomId,
-          isMaster: state.isMaster
+          enabled: state.enabled,
+          isRunning: state.isRunning,
+          lastAction: state.lastAction,
+          startTime: state.startTime,
+          idleMode: state.idleMode,
+          video: video ? {
+            currentTime: video.currentTime,
+            duration: video.duration,
+            paused: video.paused,
+            speed: video.playbackRate,
+          } : null,
         });
         break;
 
-      case 'skip':
-        {
-          const video = state.videos[request.videoIndex || 0];
-          if (video) {
-            video.currentTime += request.seconds;
-            sendResponse({ success: true, currentTime: video.currentTime });
-          } else {
-            sendResponse({ success: false, error: '视频不存在' });
-          }
-        }
+      case 'toggleIdleMode':
+        state.idleMode = !state.idleMode;
+        log(state.idleMode ? '🔇 已开启后台静默模式' : '🔊 已关闭后台静默模式');
+        sendResponse({ success: true, idleMode: state.idleMode });
+        break;
+
+      case 'clickNext':
+        clickNextButton();
+        sendResponse({ success: true });
         break;
 
       default:
         sendResponse({ success: false, error: '未知操作' });
     }
 
-    return true; // 保持消息通道开启
+    return true;
   });
-
-  // ==================== 云学堂倒计时倍速补丁 v2 ====================
-
-  /**
-   * 检测并劫持云学堂课程页面的"剩余学习时间"倒计时
-   *
-   * v2 修复：不再读取原生DOM文本做二次除法（会导致双重加速跳0）。
-   * 改为直接从 video 元素计算：
-   *   真实剩余时间 = (video.duration - video.currentTime) / playbackRate
-   *
-   * 这样显示的是"按当前倍速，真实还需要等待多少秒"。
-   *
-   * ⚠️ 重要说明：此补丁仅修改前端显示，无法绕过云学堂后端的
-   *    累计观看时长校验。课程完成由后端决定，倒计时只是UI提示。
-   */
-  (function initYxtCountdownPatch() {
-    const COUNTDOWN_SELECTOR = '.yxtulcdsdk-course-player__countdown';
-    const COUNTDOWN_TEXT_SELECTOR = '.yxtulcdsdk-course-player__countdown .yxt-color-warning';
-
-    let patchInterval = null;
-    let lastDisplayText = '';
-    let lastVideoTime = 0;
-    let lastRealTimestamp = 0;
-
-    /**
-     * 格式化秒数为 "X分钟 Y秒"
-     * 最低保留 1 秒，避免直接跳到 0
-     */
-    function formatMinutesSeconds(totalSeconds) {
-      if (totalSeconds <= 0) return '即将完成';
-      const m = Math.floor(totalSeconds / 60);
-      const s = Math.floor(totalSeconds % 60);
-      if (m > 0) {
-        return `${m}分钟 ${s}秒`;
-      }
-      if (s < 1) return '1秒';
-      return `${s}秒`;
-    }
-
-    /**
-     * 计算倍速后的真实剩余时间
-     * 直接从 video 元素取数据，不依赖原生DOM文本
-     */
-    function getAdjustedRemainingSeconds(video, speed) {
-      if (!video || !isFinite(video.duration)) return 0;
-      const rawRemaining = video.duration - video.currentTime;
-      if (rawRemaining <= 0) return 0;
-
-      // 核心计算：在倍速下，真实需要等待的时间
-      // 例如：剩余 200 秒内容，20x 倍速 → 真实只需等 10 秒
-      return rawRemaining / speed;
-    }
-
-    /**
-     * 应用倍速补丁：覆盖倒计时显示
-     */
-    function applyCountdownPatch() {
-      const textEl = document.querySelector(COUNTDOWN_TEXT_SELECTOR);
-      const containerEl = document.querySelector(COUNTDOWN_SELECTOR);
-      if (!textEl || !containerEl) return;
-
-      // 获取当前视频
-      const videos = scanVideos();
-      const video = videos[0];
-      const speed = video ? video.playbackRate : state.currentSpeed;
-      if (speed <= 1) {
-        // 1x 及以下不干预，让原生逻辑正常显示
-        lastDisplayText = '';
-        return;
-      }
-
-      // 直接从 video 计算真实剩余时间
-      const adjustedSeconds = getAdjustedRemainingSeconds(video, speed);
-
-      // 生成新的显示文本
-      const adjustedText = formatMinutesSeconds(adjustedSeconds);
-
-      // 如果和上次显示不同，则更新（减少DOM操作）
-      if (adjustedText !== lastDisplayText) {
-        textEl.textContent = adjustedText;
-        lastDisplayText = adjustedText;
-
-        // 给容器添加标记
-        containerEl.dataset.vssPatched = 'true';
-        containerEl.dataset.vssSpeed = speed.toFixed(2);
-      }
-    }
-
-    /**
-     * 启动补丁定时器
-     */
-    function startPatch() {
-      if (patchInterval) return;
-      patchInterval = setInterval(applyCountdownPatch, 500); // 每500ms更新一次
-      console.log('[VSS] 云学堂倒计时倍速补丁 v2 已启动');
-    }
-
-    /**
-     * 停止补丁定时器
-     */
-    function stopPatch() {
-      if (patchInterval) {
-        clearInterval(patchInterval);
-        patchInterval = null;
-        lastDisplayText = '';
-        console.log('[VSS] 云学堂倒计时倍速补丁 v2 已停止');
-      }
-    }
-
-    /**
-     * 监听 DOM 变化，当检测到云学堂倒计时组件出现时启动补丁
-     */
-    const domObserver = new MutationObserver(() => {
-      const containerEl = document.querySelector(COUNTDOWN_SELECTOR);
-      if (containerEl) {
-        if (!patchInterval) startPatch();
-      } else {
-        if (patchInterval) stopPatch();
-      }
-    });
-
-    domObserver.observe(document.body, { childList: true, subtree: true });
-
-    // 立即检测一次
-    if (document.querySelector(COUNTDOWN_SELECTOR)) {
-      startPatch();
-    }
-
-    // 暴露控制接口到全局（方便调试）
-    window.__vssCountdownPatch = { start: startPatch, stop: stopPatch };
-  })();
-
-  // ==================== 播放器倍速菜单扩展补丁 ====================
-
-  /**
-   * 扩展 jwplayer / 云学堂播放器自带的倍速菜单
-   *
-   * 原理：播放器原生只支持 ×1 ~ ×2，但 video.playbackRate 可以更高。
-   * 我们通过 DOM 操作，往播放器的倍速下拉菜单里注入 ×3、×5、×10、×20 选项。
-   *
-   * 点击注入的选项时：
-   *   1. 设置 video.playbackRate（触发 ratechange 事件）
-   *   2. 更新播放器 UI 上的倍速标签
-   *   3. 同步我们插件内部的 state.currentSpeed
-   *   4. 云学堂的倒计时组件会监听到 ratechange，自动联动加速
-   *
-   * 这样比直接改 video.playbackRate 更"合法"——播放器事件可能被
-   * 云学堂订阅，从而同步后端累计观看时长的计算。
-   */
-  (function initPlayerSpeedMenuPatch() {
-    const MENU_SELECTOR = '.jw-menu-playrate';
-    const LABEL_SELECTOR = '.jw-playrate-label';
-    const EXTRA_SPEEDS = [
-      { label: '×3', value: 3 },
-      { label: '×5', value: 5 },
-      { label: '×10', value: 10 },
-      { label: '×20', value: 20 }
-    ];
-
-    /**
-     * 设置播放器倍速（通过播放器菜单）
-     */
-    function setPlayerSpeed(speed) {
-      const videos = scanVideos();
-      const video = videos[0];
-      if (!video) {
-        console.warn('[VSS] 未找到视频，无法设置倍速');
-        return false;
-      }
-
-      // 1. 设置视频倍速（这会触发 ratechange 事件）
-      video.playbackRate = speed;
-      state.currentSpeed = speed;
-
-      // 2. 更新播放器倍速标签
-      const label = document.querySelector(LABEL_SELECTOR);
-      if (label) {
-        label.textContent = `x${speed}`;
-      }
-
-      // 3. 更新菜单高亮状态
-      updateMenuHighlight(speed);
-
-      // 4. 保存到 storage
-      chrome.storage.local.set({ vss_speed: speed });
-
-      // 5. 关闭菜单
-      closePlayrateMenu();
-
-      console.log(`[VSS] 播放器倍速已设为 ${speed}x`);
-      return true;
-    }
-
-    /**
-     * 更新菜单高亮状态
-     */
-    function updateMenuHighlight(activeSpeed) {
-      const menu = document.querySelector(MENU_SELECTOR);
-      if (!menu) return;
-
-      menu.querySelectorAll('.jw-option').forEach(item => {
-        const itemSpeed = parseFloat(item.dataset.speed || item.textContent.replace(/[×x]/g, ''));
-        if (Math.abs(itemSpeed - activeSpeed) < 0.01) {
-          item.classList.add('jw-active-option');
-        } else {
-          item.classList.remove('jw-active-option');
-        }
-      });
-    }
-
-    /**
-     * 关闭倍速菜单
-     */
-    function closePlayrateMenu() {
-      const menu = document.querySelector(MENU_SELECTOR);
-      if (menu) {
-        menu.style.display = 'none';
-      }
-      // 同时移除播放器的 open 状态
-      const playrateBtn = document.querySelector('.jw-icon-playrate');
-      if (playrateBtn) {
-        playrateBtn.classList.remove('jw-open');
-      }
-    }
-
-    /**
-     * 给现有选项绑定点击事件（防止原生逻辑覆盖）
-     */
-    function bindExistingItems(menu) {
-      menu.querySelectorAll('.jw-option').forEach(item => {
-        if (item.dataset.vssBound) return; // 已绑定过，跳过
-
-        const speedText = item.textContent.trim();
-        const speed = parseFloat(speedText.replace(/[×x]/g, ''));
-        if (isNaN(speed)) return;
-
-        item.dataset.speed = speed;
-        item.dataset.vssBound = 'true';
-
-        // 用捕获阶段拦截点击，确保先执行我们的逻辑
-        item.addEventListener('click', (e) => {
-          e.stopPropagation();
-          e.preventDefault();
-          setPlayerSpeed(speed);
-        }, true);
-      });
-    }
-
-    /**
-     * 向播放器倍速菜单注入新选项
-     */
-    function injectExtraOptions(menu) {
-      // 如果已经注入过，只更新绑定
-      if (menu.dataset.vssInjected === 'true') {
-        bindExistingItems(menu);
-        return;
-      }
-
-      // 先给现有选项绑定事件
-      bindExistingItems(menu);
-
-      // 注入分隔线和新选项
-      const separator = document.createElement('li');
-      separator.className = 'jw-text jw-option jw-reset';
-      separator.style.cssText = 'border-top: 1px solid rgba(255,255,255,0.2); margin: 4px 0; padding-top: 4px; pointer-events: none; opacity: 0.5;';
-      separator.textContent = '—— 扩展 ——';
-      menu.appendChild(separator);
-
-      EXTRA_SPEEDS.forEach(({ label, value }) => {
-        const li = document.createElement('li');
-        li.className = 'jw-text jw-option jw-item-0 jw-reset';
-        li.textContent = label;
-        li.dataset.speed = value;
-        li.style.cssText = 'color: #ffd700; font-weight: bold;';
-
-        li.addEventListener('click', (e) => {
-          e.stopPropagation();
-          e.preventDefault();
-          setPlayerSpeed(value);
-        });
-
-        menu.appendChild(li);
-      });
-
-      menu.dataset.vssInjected = 'true';
-      console.log('[VSS] 播放器倍速菜单扩展完成，新增：×3 ×5 ×10 ×20');
-    }
-
-    /**
-     * 尝试 patch 菜单
-     */
-    function tryPatchMenu() {
-      const menu = document.querySelector(MENU_SELECTOR);
-      if (menu) {
-        injectExtraOptions(menu);
-      }
-    }
-
-    // 监听 DOM 变化，在菜单出现时自动注入
-    const menuObserver = new MutationObserver((mutations) => {
-      // 只有当菜单变为可见时才注入
-      const menu = document.querySelector(MENU_SELECTOR);
-      if (menu && menu.style.display !== 'none' && getComputedStyle(menu).display !== 'none') {
-        injectExtraOptions(menu);
-      }
-    });
-
-    menuObserver.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['style', 'class'] });
-
-    // 立即尝试一次
-    tryPatchMenu();
-
-    // 暴露全局接口
-    window.__vssPlayerSpeedPatch = {
-      setSpeed: setPlayerSpeed,
-      getSpeed: () => state.currentSpeed,
-      speeds: EXTRA_SPEEDS.map(s => s.value)
-    };
-  })();
 
   // ==================== 初始化 ====================
-
-  // 页面加载时扫描视频
-  scanVideos();
-
-  // 监听 DOM 变化，自动检测新视频
-  const observer = new MutationObserver(() => {
-    scanVideos();
-  });
-  observer.observe(document.body, { childList: true, subtree: true });
-
-  // 恢复上次倍速设置
-  chrome.storage.local.get(['vss_speed'], (result) => {
-    if (result.vss_speed) {
-      setSpeed(result.vss_speed);
-    }
-  });
-
-  // 监听键盘快捷键
-  document.addEventListener('keydown', (e) => {
-    // 避免在输入框中触发
-    if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.isContentEditable) {
-      return;
-    }
-
-    // Alt + > 加速
-    if (e.altKey && e.key === '.') {
-      e.preventDefault();
-      adjustSpeed(0.25);
-    }
-    // Alt + < 减速
-    if (e.altKey && e.key === ',') {
-      e.preventDefault();
-      adjustSpeed(-0.25);
-    }
-    // Alt + R 重置
-    if (e.altKey && e.key.toLowerCase() === 'r') {
-      e.preventDefault();
-      setSpeed(1.0);
-    }
-    // Alt + P 播放/暂停
-    if (e.altKey && e.key.toLowerCase() === 'p') {
-      e.preventDefault();
-      const video = state.videos[0];
-      if (video) video.paused ? video.play() : video.pause();
-    }
-  });
-
-  console.log('[VSS] 视频倍速同步助手已加载');
+  log('📦 云学堂自动挂课助手已加载');
 })();
