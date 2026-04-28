@@ -1,0 +1,13 @@
+{
+  "name": "video-speed-sync-server",
+  "version": "1.0.0",
+  "description": "视频倍速同步 WebSocket 服务器",
+  "main": "sync-server.js",
+  "scripts": {
+    "start": "node sync-server.js",
+    "start:ssl": "node sync-server-ssl.js"
+  },
+  "dependencies": {
+    "ws": "^8.14.2"
+  }
+}
