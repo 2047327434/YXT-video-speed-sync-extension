@@ -584,6 +584,194 @@
     window.__vssCountdownPatch = { start: startPatch, stop: stopPatch };
   })();
 
+  // ==================== 播放器倍速菜单扩展补丁 ====================
+
+  /**
+   * 扩展 jwplayer / 云学堂播放器自带的倍速菜单
+   *
+   * 原理：播放器原生只支持 ×1 ~ ×2，但 video.playbackRate 可以更高。
+   * 我们通过 DOM 操作，往播放器的倍速下拉菜单里注入 ×3、×5、×10、×20 选项。
+   *
+   * 点击注入的选项时：
+   *   1. 设置 video.playbackRate（触发 ratechange 事件）
+   *   2. 更新播放器 UI 上的倍速标签
+   *   3. 同步我们插件内部的 state.currentSpeed
+   *   4. 云学堂的倒计时组件会监听到 ratechange，自动联动加速
+   *
+   * 这样比直接改 video.playbackRate 更"合法"——播放器事件可能被
+   * 云学堂订阅，从而同步后端累计观看时长的计算。
+   */
+  (function initPlayerSpeedMenuPatch() {
+    const MENU_SELECTOR = '.jw-menu-playrate';
+    const LABEL_SELECTOR = '.jw-playrate-label';
+    const EXTRA_SPEEDS = [
+      { label: '×3', value: 3 },
+      { label: '×5', value: 5 },
+      { label: '×10', value: 10 },
+      { label: '×20', value: 20 }
+    ];
+
+    /**
+     * 设置播放器倍速（通过播放器菜单）
+     */
+    function setPlayerSpeed(speed) {
+      const videos = scanVideos();
+      const video = videos[0];
+      if (!video) {
+        console.warn('[VSS] 未找到视频，无法设置倍速');
+        return false;
+      }
+
+      // 1. 设置视频倍速（这会触发 ratechange 事件）
+      video.playbackRate = speed;
+      state.currentSpeed = speed;
+
+      // 2. 更新播放器倍速标签
+      const label = document.querySelector(LABEL_SELECTOR);
+      if (label) {
+        label.textContent = `x${speed}`;
+      }
+
+      // 3. 更新菜单高亮状态
+      updateMenuHighlight(speed);
+
+      // 4. 保存到 storage
+      chrome.storage.local.set({ vss_speed: speed });
+
+      // 5. 关闭菜单
+      closePlayrateMenu();
+
+      console.log(`[VSS] 播放器倍速已设为 ${speed}x`);
+      return true;
+    }
+
+    /**
+     * 更新菜单高亮状态
+     */
+    function updateMenuHighlight(activeSpeed) {
+      const menu = document.querySelector(MENU_SELECTOR);
+      if (!menu) return;
+
+      menu.querySelectorAll('.jw-option').forEach(item => {
+        const itemSpeed = parseFloat(item.dataset.speed || item.textContent.replace(/[×x]/g, ''));
+        if (Math.abs(itemSpeed - activeSpeed) < 0.01) {
+          item.classList.add('jw-active-option');
+        } else {
+          item.classList.remove('jw-active-option');
+        }
+      });
+    }
+
+    /**
+     * 关闭倍速菜单
+     */
+    function closePlayrateMenu() {
+      const menu = document.querySelector(MENU_SELECTOR);
+      if (menu) {
+        menu.style.display = 'none';
+      }
+      // 同时移除播放器的 open 状态
+      const playrateBtn = document.querySelector('.jw-icon-playrate');
+      if (playrateBtn) {
+        playrateBtn.classList.remove('jw-open');
+      }
+    }
+
+    /**
+     * 给现有选项绑定点击事件（防止原生逻辑覆盖）
+     */
+    function bindExistingItems(menu) {
+      menu.querySelectorAll('.jw-option').forEach(item => {
+        if (item.dataset.vssBound) return; // 已绑定过，跳过
+
+        const speedText = item.textContent.trim();
+        const speed = parseFloat(speedText.replace(/[×x]/g, ''));
+        if (isNaN(speed)) return;
+
+        item.dataset.speed = speed;
+        item.dataset.vssBound = 'true';
+
+        // 用捕获阶段拦截点击，确保先执行我们的逻辑
+        item.addEventListener('click', (e) => {
+          e.stopPropagation();
+          e.preventDefault();
+          setPlayerSpeed(speed);
+        }, true);
+      });
+    }
+
+    /**
+     * 向播放器倍速菜单注入新选项
+     */
+    function injectExtraOptions(menu) {
+      // 如果已经注入过，只更新绑定
+      if (menu.dataset.vssInjected === 'true') {
+        bindExistingItems(menu);
+        return;
+      }
+
+      // 先给现有选项绑定事件
+      bindExistingItems(menu);
+
+      // 注入分隔线和新选项
+      const separator = document.createElement('li');
+      separator.className = 'jw-text jw-option jw-reset';
+      separator.style.cssText = 'border-top: 1px solid rgba(255,255,255,0.2); margin: 4px 0; padding-top: 4px; pointer-events: none; opacity: 0.5;';
+      separator.textContent = '—— 扩展 ——';
+      menu.appendChild(separator);
+
+      EXTRA_SPEEDS.forEach(({ label, value }) => {
+        const li = document.createElement('li');
+        li.className = 'jw-text jw-option jw-item-0 jw-reset';
+        li.textContent = label;
+        li.dataset.speed = value;
+        li.style.cssText = 'color: #ffd700; font-weight: bold;';
+
+        li.addEventListener('click', (e) => {
+          e.stopPropagation();
+          e.preventDefault();
+          setPlayerSpeed(value);
+        });
+
+        menu.appendChild(li);
+      });
+
+      menu.dataset.vssInjected = 'true';
+      console.log('[VSS] 播放器倍速菜单扩展完成，新增：×3 ×5 ×10 ×20');
+    }
+
+    /**
+     * 尝试 patch 菜单
+     */
+    function tryPatchMenu() {
+      const menu = document.querySelector(MENU_SELECTOR);
+      if (menu) {
+        injectExtraOptions(menu);
+      }
+    }
+
+    // 监听 DOM 变化，在菜单出现时自动注入
+    const menuObserver = new MutationObserver((mutations) => {
+      // 只有当菜单变为可见时才注入
+      const menu = document.querySelector(MENU_SELECTOR);
+      if (menu && menu.style.display !== 'none' && getComputedStyle(menu).display !== 'none') {
+        injectExtraOptions(menu);
+      }
+    });
+
+    menuObserver.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['style', 'class'] });
+
+    // 立即尝试一次
+    tryPatchMenu();
+
+    // 暴露全局接口
+    window.__vssPlayerSpeedPatch = {
+      setSpeed: setPlayerSpeed,
+      getSpeed: () => state.currentSpeed,
+      speeds: EXTRA_SPEEDS.map(s => s.value)
+    };
+  })();
+
   // ==================== 初始化 ====================
 
   // 页面加载时扫描视频
