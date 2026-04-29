@@ -24,7 +24,7 @@
 ## 📁 目录结构
 
 ```
-video-speed-sync-extension/
+YXT-auto-study-helper/
 ├── manifest.json        # 插件配置
 ├── content.js           # 核心挂机逻辑（注入页面）
 ├── background.js        # 后台服务
@@ -44,7 +44,7 @@ video-speed-sync-extension/
 1. 打开 Chrome，地址栏输入 `chrome://extensions/`
 2. 右上角开启「**开发者模式**」
 3. 点击「**加载已解压的扩展程序**」
-4. 选择 `video-speed-sync-extension` 文件夹
+4. 选择 `YXT-auto-study-helper` 文件夹
 
 ---
 
