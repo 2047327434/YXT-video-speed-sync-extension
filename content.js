@@ -25,6 +25,8 @@
     checkTimer: null,         // 主检测循环定时器
   };
 
+  const STORAGE_KEY = 'yxt_auto_study_state';
+
   // ==================== DOM 选择器 ====================
   const SELECTORS = {
     video: 'video',
@@ -74,6 +76,41 @@
   // ==================== 核心挂机逻辑 ====================
 
   /**
+   * 保存状态到 storage（持久化）
+   */
+  function saveState() {
+    chrome.storage.local.set({
+      [STORAGE_KEY]: {
+        enabled: state.enabled,
+        idleMode: state.idleMode,
+        startTime: state.startTime,
+        courseCurrent: state.courseCurrent,
+      }
+    });
+  }
+
+  /**
+   * 从 storage 恢复状态
+   */
+  async function restoreState() {
+    return new Promise((resolve) => {
+      chrome.storage.local.get([STORAGE_KEY], (result) => {
+        const saved = result[STORAGE_KEY];
+        if (saved && saved.enabled) {
+          state.enabled = saved.enabled;
+          state.idleMode = saved.idleMode ?? true;
+          state.courseCurrent = saved.courseCurrent ?? 0;
+          // startTime 恢复为当前时间（避免页面刷新后计算运行时长出错）
+          state.startTime = Date.now();
+          resolve(true);
+        } else {
+          resolve(false);
+        }
+      });
+    });
+  }
+
+  /**
    * 启动挂机
    */
   function startAutoStudy() {
@@ -81,6 +118,9 @@
     state.enabled = true;
     state.isRunning = true;
     state.startTime = Date.now();
+
+    // 持久化状态
+    saveState();
 
     log('🚀 自动挂机已启动');
     broadcastToPopup({ type: 'started', startTime: state.startTime });
@@ -101,6 +141,9 @@
   function stopAutoStudy() {
     state.enabled = false;
     state.isRunning = false;
+
+    // 清除持久化状态
+    chrome.storage.local.remove(STORAGE_KEY);
 
     if (state.checkTimer) {
       clearInterval(state.checkTimer);
@@ -388,5 +431,15 @@
   });
 
   // ==================== 初始化 ====================
-  log('📦 云学堂自动挂课助手已加载');
+
+  // 页面加载时，先尝试从 storage 恢复挂机状态
+  // 这样即使 popup 被关闭或页面刷新，挂机也能自动继续
+  restoreState().then((wasRunning) => {
+    if (wasRunning) {
+      log('📦 云学堂自动挂课助手已加载，检测到之前有挂机任务，正在自动恢复...');
+      startAutoStudy();
+    } else {
+      log('📦 云学堂自动挂课助手已加载，等待启动指令');
+    }
+  });
 })();

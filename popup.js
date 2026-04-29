@@ -23,12 +23,23 @@ document.addEventListener('DOMContentLoaded', () => {
   let runtimeTimer = null;
   let courseCount = 0;
 
+  const STORAGE_KEY = 'yxt_auto_study_state';
+
   // ==================== 初始化 ====================
 
   chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
     if (tabs[0]) {
       currentTabId = tabs[0].id;
-      refreshStatus();
+      // 先从 storage 读取状态，确保 popup 打开时立即显示正确状态
+      chrome.storage.local.get([STORAGE_KEY], (result) => {
+        const saved = result[STORAGE_KEY];
+        if (saved && saved.enabled) {
+          setRunningUI(true);
+          startRuntimeTimer();
+        }
+        // 然后再向 content script 请求最新状态
+        refreshStatus();
+      });
     }
   });
 
